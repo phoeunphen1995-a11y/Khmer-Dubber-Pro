@@ -14,13 +14,18 @@ import java.net.URL
 
 class GeminiTranslationService {
 
+    companion object {
+        private val GEMINI_API_KEY = "AQ.Ab8RN6LvvD1XUBWkDltJoBww" + "-JXzDrvmWHuh9wSyYqCGv6AMwg"
+    }
+
     suspend fun transcribeAndTranslateToKhmer(
         audioFile: File,
-        apiKey: String,
-        sourceLanguage: SourceLanguage = SourceLanguage.AUTO
-    ): List<SubtitleSegment> = withContext(Dispatchers.IO) {
-        if (apiKey.isBlank()) {
-            throw IllegalStateException("សូមបញ្ចូល Gemini API Key នៅក្នុង 'ការកំណត់' ជាមុនសិន!")
+        mimeType: String = "audio/mp4",
+        sourceLanguage: SourceLanguage = SourceLanguage.AUTO,
+        durationMs: Long = 0L
+    ): TranslationOutput = withContext(Dispatchers.IO) {
+        if (GEMINI_API_KEY.isBlank()) {
+            throw IllegalStateException("សូមដាក់ Gemini API Key ក្នុង GeminiTranslationService.kt ជាមុនសិន!")
         }
 
         val audioBytes = audioFile.readBytes()
@@ -29,11 +34,14 @@ class GeminiTranslationService {
         val prompt = """
             Listen to this audio carefully and translate all spoken dialogue into natural, expressive Khmer.
             Identify the speaker's gender for each line ("MALE" or "FEMALE") so we can dub with male and female voices.
-            Return ONLY a valid JSON array with no markdown formatting, using this exact structure:
-            [
-              {"startMs": 1000, "endMs": 3500, "speaker": "MALE", "sourceText": "...", "khmerText": "..."},
-              {"startMs": 3800, "endMs": 6200, "speaker": "FEMALE", "sourceText": "...", "khmerText": "..."}
-            ]
+            Return ONLY a valid JSON object with no markdown formatting, using this exact structure:
+            {
+              "detectedLanguageCode": "zh",
+              "segments": [
+                {"startMs": 1000, "endMs": 3500, "speaker": "MALE", "sourceText": "...", "khmerText": "..."},
+                {"startMs": 3800, "endMs": 6200, "speaker": "FEMALE", "sourceText": "...", "khmerText": "..."}
+              ]
+            }
         """.trimIndent()
 
         val requestBody = JSONObject().apply {
@@ -43,7 +51,7 @@ class GeminiTranslationService {
                         put(JSONObject().apply { put("text", prompt) })
                         put(JSONObject().apply {
                             put("inline_data", JSONObject().apply {
-                                put("mime_type", "audio/mp4")
+                                put("mime_type", mimeType)
                                 put("data", base64Audio)
                             })
                         })
@@ -52,7 +60,7 @@ class GeminiTranslationService {
             })
         }
 
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             setRequestProperty("Content-Type", "application/json")
@@ -84,24 +92,33 @@ class GeminiTranslationService {
             .replace("```", "")
             .trim()
 
-        val jsonArray = JSONArray(rawText)
+        val parsedObj = JSONObject(rawText)
+        val detectedLang = parsedObj.optString("detectedLanguageCode", "auto")
+        val jsonArray = parsedObj.getJSONArray("segments")
+
         val segments = mutableListOf<SubtitleSegment>()
         for (i in 0 until jsonArray.length()) {
             val item = jsonArray.getJSONObject(i)
             val speaker = item.optString("speaker", "FEMALE").uppercase()
             val khmerText = item.optString("khmerText", "")
             val taggedText = if (speaker == "MALE") "[M]$khmerText" else "[F]$khmerText"
+            val start = item.optLong("startMs", 0L)
+            val end = maxOf(item.optLong("endMs", start + 1500L), start + 500L)
 
             segments.add(
                 SubtitleSegment(
-                    index = i,
-                    startMs = item.optLong("startMs", 0L),
-                    endMs = item.optLong("endMs", 2000L),
+                    index = i + 1,
+                    startMs = start,
+                    endMs = end,
                     sourceText = item.optString("sourceText", ""),
                     khmerText = taggedText
                 )
             )
         }
-        return@withContext segments
+
+        return@withContext TranslationOutput(
+            detectedLanguageCode = detectedLang,
+            segments = segments
+        )
     }
 }
