@@ -60,9 +60,9 @@ class KhmerVoiceSynthesizer(private val context: Context) {
             val clips = mutableMapOf<Int, File>()
 
             segments.forEachIndexed { idx, segment ->
-                val text = segment.khmerText.trim()
+                val text = segment.khmerText
                 if (text.isNotEmpty()) {
-                    val outWav = File(ttsDir, "seg_${segment.index}.wav")
+ outWav = File(ttsDir, "seg_${segment.index}.wav")
                     if (outWav.exists()) outWav.delete()
                     val utteranceId = "${projectId}_${segment.index}"
                     val ok = synthesizeSingleClip(tts, text, outWav, utteranceId)
