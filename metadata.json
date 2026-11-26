@@ -1,0 +1,6 @@
+{
+  "name": "Khmer AI Video Translator Pro",
+  "description": "AI-powered Khmer video translator with speech transcription, translation, Khmer voice dubbing, SRT subtitles, and background audio preservation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
