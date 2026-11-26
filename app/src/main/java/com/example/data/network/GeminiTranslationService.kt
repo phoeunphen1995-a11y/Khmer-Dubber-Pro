@@ -17,11 +17,12 @@ class GeminiTranslationService {
 
     companion object {
         private val GEMINI_API_KEY = "AQ.Ab8RN6LvvD1XUBWkDltJoBww" + "-JXzDrvmWHuh9wSyYqCGv6AMwg"
-        private val FALLBACK_MODELS = listOf(
-            "gemini-3.8-flash",
+        // ដាក់ម៉ូដែល flash-lite មុនគេដើម្បីឲ្យបកប្រែលឿនបំផុត
+        private val ULTRA_FAST_MODELS = listOf(
             "gemini-3.8-flash-lite",
-            "gemini-3.5-flash",
-            "gemini-2.5-flash-lite"
+            "gemini-2.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash"
         )
     }
 
@@ -36,19 +37,16 @@ class GeminiTranslationService {
         }
 
         val audioBytes = audioFile.readBytes()
+        if (audioBytes.isEmpty()) {
+            throw IllegalStateException("ឯកសារសំឡេងទទេ មិនអាចបកប្រែបានទេ!")
+        }
         val base64Audio = Base64.encodeToString(audioBytes, Base64.NO_WRAP)
 
+        // Prompt ខ្លីបំផុតដើម្បីឲ្យ AI បកប្រែចេញលឿនភ្លាមៗ
         val prompt = """
-            Listen to this audio carefully and translate all spoken dialogue into natural, expressive Khmer.
-            Identify the speaker's gender for each line ("MALE" or "FEMALE") so we can dub with male and female voices.
-            Return ONLY a valid JSON object with no markdown formatting, using this exact structure:
-            {
-              "detectedLanguageCode": "zh",
-              "segments": [
-                {"startMs": 1000, "endMs": 3500, "speaker": "MALE", "sourceText": "...", "khmerText": "..."},
-                {"startMs": 3800, "endMs": 6200, "speaker": "FEMALE", "sourceText": "...", "khmerText": "..."}
-              ]
-            }
+            Translate speech to natural Khmer. Tag gender ("MALE"/"FEMALE").
+            JSON ONLY:
+            {"detectedLanguageCode":"zh","segments":[{"startMs":1000,"endMs":3500,"speaker":"MALE","sourceText":"","khmerText":"..."}]}
         """.trimIndent()
 
         val requestBody = JSONObject().apply {
@@ -65,22 +63,30 @@ class GeminiTranslationService {
                     })
                 })
             })
+            put("generationConfig", JSONObject().apply {
+                put("responseMimeType", "application/json")
+                put("temperature", 0.1)
+                put("thinkingConfig", JSONObject().apply {
+                    put("thinkingBudget", 0)
+                })
+            })
         }
 
         val payloadBytes = requestBody.toString().toByteArray(Charsets.UTF_8)
-        var lastError = "Unknown error"
+        var lastError = "Server ជាប់រវល់ សូមព្យាយាមម្តងទៀត"
         var responseText: String? = null
 
-        for (modelName in FALLBACK_MODELS) {
+        outerLoop@ for (modelName in ULTRA_FAST_MODELS) {
             for (attempt in 1..2) {
+                var conn: HttpURLConnection? = null
                 try {
                     val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$GEMINI_API_KEY")
-                    val conn = (url.openConnection() as HttpURLConnection).apply {
+                    conn = (url.openConnection() as HttpURLConnection).apply {
                         requestMethod = "POST"
                         setRequestProperty("Content-Type", "application/json")
                         doOutput = true
-                        connectTimeout = 60000
-                        readTimeout = 120000
+                        connectTimeout = 10000
+                        readTimeout = 35000
                     }
 
                     conn.outputStream.use { it.write(payloadBytes) }
@@ -88,31 +94,30 @@ class GeminiTranslationService {
                     val responseCode = conn.responseCode
                     if (responseCode in 200..299) {
                         responseText = conn.inputStream.bufferedReader().use { it.readText() }
-                        break
+                        break@outerLoop
                     } else {
                         val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $responseCode"
-                        Log.w("GeminiTranslation", "Model $modelName (attempt $attempt) failed ($responseCode): $err")
+                        Log.w("GeminiTranslation", "$modelName ($responseCode): $err")
                         lastError = "Gemini API Error ($responseCode): $err"
-                        // បើម៉ូដែលអត់មាន (404) ប្តូរទៅម៉ូដែលបន្ទាប់ភ្លាម
-                        if (responseCode == 404) break
-                        // បើជាប់រវល់ (503 ឬ 429) រង់ចាំ 2 វិនាទីរួចសាកម្តងទៀត
-                        delay(2000L)
+                        // បើម៉ូដែលអត់ស្គាល់ (404) ឬជាប់រវល់ (503) ប្តូរទៅម៉ូដែលបន្ទាប់ភ្លាមៗ
+                        if (responseCode == 404 || responseCode == 503) break
+                        delay(300L)
                     }
                 } catch (e: Exception) {
-                    Log.w("GeminiTranslation", "Model $modelName exception: ${e.message}")
-                    lastError = e.message ?: "Network error"
-                    delay(1500L)
+                    Log.w("GeminiTranslation", "$modelName exception: ${e.message}")
+                    lastError = e.message ?: "ការតភ្ជាប់យឺត"
+                    delay(300L)
+                } finally {
+                    conn?.disconnect()
                 }
             }
-            if (responseText != null) break
         }
 
         if (responseText == null) {
             throw RuntimeException(lastError)
         }
 
-        val jsonResponse = JSONObject(responseText)
-        val rawText = jsonResponse
+        val rawText = JSONObject(responseText)
             .getJSONArray("candidates")
             .getJSONObject(0)
             .getJSONObject("content")
@@ -127,18 +132,20 @@ class GeminiTranslationService {
         val detectedLang = parsedObj.optString("detectedLanguageCode", "auto")
         val jsonArray = parsedObj.getJSONArray("segments")
 
-        val segments = mutableListOf<SubtitleSegment>()
+        val segments = ArrayList<SubtitleSegment>(jsonArray.length())
         for (i in 0 until jsonArray.length()) {
             val item = jsonArray.getJSONObject(i)
             val speaker = item.optString("speaker", "FEMALE").uppercase()
-            val khmerText = item.optString("khmerText", "")
+            val khmerText = item.optString("khmerText", "").trim()
+            if (khmerText.isEmpty()) continue
+
             val taggedText = if (speaker == "MALE") "[M]$khmerText" else "[F]$khmerText"
             val start = item.optLong("startMs", 0L)
             val end = maxOf(item.optLong("endMs", start + 1500L), start + 500L)
 
             segments.add(
                 SubtitleSegment(
-                    index = i + 1,
+                    index = segments.size + 1,
                     startMs = start,
                     endMs = end,
                     sourceText = item.optString("sourceText", ""),
