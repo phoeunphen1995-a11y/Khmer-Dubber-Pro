@@ -14,7 +14,7 @@ import java.net.URL
 
 class GeminiTranslationService {
 
-    suspend fun translateAudioToKhmer(
+    suspend fun transcribeAndTranslateToKhmer(
         audioFile: File,
         apiKey: String,
         sourceLanguage: SourceLanguage = SourceLanguage.AUTO
@@ -31,8 +31,8 @@ class GeminiTranslationService {
             Identify the speaker's gender for each line ("MALE" or "FEMALE") so we can dub with male and female voices.
             Return ONLY a valid JSON array with no markdown formatting, using this exact structure:
             [
-              {"startMs": 1000, "endMs": 3500, "speaker": "MALE", "originalText": "...", "khmerText": "..."},
-              {"startMs": 3800, "endMs": 6200, "speaker": "FEMALE", "originalText": "...", "khmerText": "..."}
+              {"startMs": 1000, "endMs": 3500, "speaker": "MALE", "sourceText": "...", "khmerText": "..."},
+              {"startMs": 3800, "endMs": 6200, "speaker": "FEMALE", "sourceText": "...", "khmerText": "..."}
             ]
         """.trimIndent()
 
@@ -94,10 +94,11 @@ class GeminiTranslationService {
 
             segments.add(
                 SubtitleSegment(
+                    index = i,
                     startMs = item.optLong("startMs", 0L),
                     endMs = item.optLong("endMs", 2000L),
-                    originalText = item.optString("originalText", ""),
-                    translatedText = taggedText
+                    sourceText = item.optString("sourceText", ""),
+                    khmerText = taggedText
                 )
             )
         }
