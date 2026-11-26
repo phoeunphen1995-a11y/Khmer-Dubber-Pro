@@ -10,12 +10,12 @@ import com.example.data.model.SubtitleSegment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.util.Locale
 import kotlin.coroutines.resume
 
-private const val TAG = "KhmerVoiceSynth"
+private const val TAG = "KhmerVoiceSynthesizer"
 
 data class TtsSynthesisResult(
     val ttsAvailable: Boolean,
@@ -30,10 +30,10 @@ class KhmerVoiceSynthesizer(private val context: Context) {
         projectId: String,
         segments: List<SubtitleSegment>,
         voiceProfile: DubbingVoiceProfile,
-        onSegmentProgress: (completed: Int, total: Int) -> Unit
-    ): TtsSynthesisResult = withContext(Dispatchers.Main) {
+        onSegmentProgress: (completed: Int, total: Int) -> Unit = { _, _ -> }
+    ): TtsSynthesisResult = withContext(Dispatchers.IO) {
         if (segments.isEmpty()) {
-            return@withContext TtsSynthesisResult(ttsAvailable = true, clipFilesBySegmentIndex = emptyMap())
+            return@withContext TtsSynthesisResult(ttsAvailable = false, clipFilesBySegmentIndex = emptyMap())
         }
 
         val tts = initTts() ?: return@withContext TtsSynthesisResult(
@@ -45,7 +45,7 @@ class KhmerVoiceSynthesizer(private val context: Context) {
             val availability = tts.isLanguageAvailable(khmerLocale)
             val khmerSupported = availability >= TextToSpeech.LANG_AVAILABLE
             if (!khmerSupported) {
-                Log.w(TAG, "Khmer TTS voice pack unavailable on device (code=$availability)")
+                Log.w(TAG, "Khmer TTS voice is not installed on this device (code=$availability)")
                 return@withContext TtsSynthesisResult(
                     ttsAvailable = false,
                     clipFilesBySegmentIndex = emptyMap()
@@ -56,16 +56,33 @@ class KhmerVoiceSynthesizer(private val context: Context) {
             tts.setPitch(voiceProfile.pitch)
             tts.setSpeechRate(voiceProfile.speechRate)
 
-            val ttsDir = File(context.filesDir, "tts/$projectId").apply { mkdirs() }
+            val ttsDir = File(context.cacheDir, "tts/$projectId").apply { mkdirs() }
             val clips = mutableMapOf<Int, File>()
 
             segments.forEachIndexed { idx, segment ->
-                val text = segment.khmerText
+                val rawText = segment.khmerText.trim()
+                val isMale = rawText.startsWith("[M]", ignoreCase = true)
+                val isFemale = rawText.startsWith("[F]", ignoreCase = true)
+                val text = rawText
+                    .removePrefix("[M]")
+                    .removePrefix("[m]")
+                    .removePrefix("[F]")
+                    .removePrefix("[f]")
+                    .trim()
+
+                tts.setPitch(
+                    when {
+                        isMale -> 0.75f
+                        isFemale -> 1.15f
+                        else -> voiceProfile.pitch
+                    }
+                )
+
                 if (text.isNotEmpty()) {
- outWav = File(ttsDir, "seg_${segment.index}.wav")
+                    val outWav = File(ttsDir, "seg_${segment.index}.wav")
                     if (outWav.exists()) outWav.delete()
-                    val utteranceId = "${projectId}_${segment.index}"
-                    val ok = synthesizeSingleClip(tts, text, outWav, utteranceId)
+                    val utteranceId = "utt_${projectId}_${segment.index}"
+                    val ok = synthesizeToFile(tts, text, outWav, utteranceId)
                     if (ok && outWav.exists() && outWav.length() > 44L) {
                         clips[segment.index] = outWav
                     }
@@ -74,7 +91,7 @@ class KhmerVoiceSynthesizer(private val context: Context) {
             }
 
             TtsSynthesisResult(
-                ttsAvailable = clips.isNotEmpty() || segments.all { it.khmerText.isBlank() },
+                ttsAvailable = clips.isNotEmpty(),
                 clipFilesBySegmentIndex = clips
             )
         } finally {
@@ -85,7 +102,7 @@ class KhmerVoiceSynthesizer(private val context: Context) {
         }
     }
 
-    private suspend fun initTts(): TextToSpeech? = withTimeoutOrNull(8_000L) {
+    private suspend fun initTts(): TextToSpeech? = withTimeout(10_000L) {
         suspendCancellableCoroutine { cont ->
             var engine: TextToSpeech? = null
             engine = TextToSpeech(context.applicationContext) { status ->
@@ -104,15 +121,16 @@ class KhmerVoiceSynthesizer(private val context: Context) {
         }
     }
 
-    private suspend fun synthesizeSingleClip(
+    private suspend fun synthesizeToFile(
         tts: TextToSpeech,
         text: String,
         outFile: File,
         utteranceId: String
-    ): Boolean = withTimeoutOrNull(15_000L) {
+    ): Boolean = withTimeout(30_000L) {
         suspendCancellableCoroutine { cont ->
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(id: String?) {}
+                override fun onStart(id: String?) = Unit
+
                 override fun onDone(id: String?) {
                     if (id == utteranceId && cont.isActive) {
                         cont.resume(true)
@@ -133,11 +151,13 @@ class KhmerVoiceSynthesizer(private val context: Context) {
                 }
             })
 
-            val params = Bundle()
+            val params = Bundle().apply {
+                putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
+            }
             val result = tts.synthesizeToFile(text, params, outFile, utteranceId)
             if (result != TextToSpeech.SUCCESS && cont.isActive) {
                 cont.resume(false)
             }
         }
-    } ?: false
+    }
 }
