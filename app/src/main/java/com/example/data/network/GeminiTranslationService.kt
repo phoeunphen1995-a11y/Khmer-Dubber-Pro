@@ -5,6 +5,7 @@ import android.util.Log
 import com.example.data.model.SourceLanguage
 import com.example.data.model.SubtitleSegment
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -16,6 +17,12 @@ class GeminiTranslationService {
 
     companion object {
         private val GEMINI_API_KEY = "AQ.Ab8RN6LvvD1XUBWkDltJoBww" + "-JXzDrvmWHuh9wSyYqCGv6AMwg"
+        private val FALLBACK_MODELS = listOf(
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-2.5-flash-lite"
+        )
     }
 
     suspend fun transcribeAndTranslateToKhmer(
@@ -60,24 +67,48 @@ class GeminiTranslationService {
             })
         }
 
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=$GEMINI_API_KEY")
-        val conn = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            setRequestProperty("Content-Type", "application/json")
-            doOutput = true
-            connectTimeout = 60000
-            readTimeout = 120000
+        val payloadBytes = requestBody.toString().toByteArray(Charsets.UTF_8)
+        var lastError = "Unknown error"
+        var responseText: String? = null
+
+        for (modelName in FALLBACK_MODELS) {
+            for (attempt in 1..2) {
+                try {
+                    val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$GEMINI_API_KEY")
+                    val conn = (url.openConnection() as HttpURLConnection).apply {
+                        requestMethod = "POST"
+                        setRequestProperty("Content-Type", "application/json")
+                        doOutput = true
+                        connectTimeout = 60000
+                        readTimeout = 120000
+                    }
+
+                    conn.outputStream.use { it.write(payloadBytes) }
+
+                    val responseCode = conn.responseCode
+                    if (responseCode in 200..299) {
+                        responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                        break
+                    } else {
+                        val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "HTTP $responseCode"
+                        Log.w("GeminiTranslation", "Model $modelName (attempt $attempt) failed ($responseCode): $err")
+                        lastError = "Gemini API Error ($responseCode): $err"
+                        // បើម៉ូដែលអត់មាន (404) ប្តូរទៅម៉ូដែលបន្ទាប់ភ្លាម
+                        if (responseCode == 404) break
+                        // បើជាប់រវល់ (503 ឬ 429) រង់ចាំ 2 វិនាទីរួចសាកម្តងទៀត
+                        delay(2000L)
+                    }
+                } catch (e: Exception) {
+                    Log.w("GeminiTranslation", "Model $modelName exception: ${e.message}")
+                    lastError = e.message ?: "Network error"
+                    delay(1500L)
+                }
+            }
+            if (responseText != null) break
         }
 
-        conn.outputStream.use { it.write(requestBody.toString().toByteArray(Charsets.UTF_8)) }
-
-        val responseCode = conn.responseCode
-        val responseText = if (responseCode in 200..299) {
-            conn.inputStream.bufferedReader().use { it.readText() }
-        } else {
-            val err = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "Unknown error"
-            Log.e("GeminiTranslation", "API Error $responseCode: $err")
-            throw RuntimeException("Gemini API Error ($responseCode): $err")
+        if (responseText == null) {
+            throw RuntimeException(lastError)
         }
 
         val jsonResponse = JSONObject(responseText)
