@@ -18,9 +18,10 @@ class GeminiTranslationService {
     companion object {
         private val GEMINI_API_KEY = "AQ.Ab8RN6LvvD1XUBWkDltJoBww" + "-JXzDrvmWHuh9wSyYqCGv6AMwg"
         private val MODELS = listOf(
+            "gemini-3.5-flash-lite",
             "gemini-3.8-flash-lite",
             "gemini-3.8-flash",
-            "gemini-2.5-flash-lite"
+            "gemini-3.5-flash"
         )
         // បំបែកការបកប្រែជាកំណាត់ៗ (៣ នាទីម្តង) ដើម្បីឲ្យវីដេអូវែង ៣០ នាទីបកប្រែបានគ្រប់ម៉ាត់ និងមិន Timeout
         private const val CHUNK_DURATION_MS = 180_000L
