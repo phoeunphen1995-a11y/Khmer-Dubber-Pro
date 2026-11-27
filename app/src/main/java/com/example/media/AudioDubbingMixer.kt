@@ -21,7 +21,9 @@ import com.example.data.model.SubtitleSegment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -47,13 +49,13 @@ class AudioDubbingMixer(private val context: Context) {
         bgmDuckingLevel: Float
     ): File {
         val exportsDir = File(context.filesDir, "exports").apply { mkdirs() }
-        val outputMp4 = File(exportsDir, "${projectId}_khmer_dubbed.mp4")
+        val outputMp4 = File(exportsDir, "dubbed_${projectId}.mp4")
         if (outputMp4.exists()) outputMp4.delete()
 
         val compatibleVideoFile = ensureMp4VideoTrack(projectId, sourceVideoFile)
 
-        val pcmBufferFile = File(context.cacheDir, "${projectId}_mix.pcm")
-        val mixedAacFile = File(context.cacheDir, "${projectId}_mixed.m4a")
+        val pcmBufferFile = File(context.cacheDir, "mix_${projectId}.pcm")
+        val mixedAacFile = File(context.cacheDir, "mix_${projectId}.m4a")
         try {
             withContext(Dispatchers.IO) {
                 buildMixedPcmFile(
@@ -103,7 +105,7 @@ class AudioDubbingMixer(private val context: Context) {
 
         if (!needsTranscode) return sourceVideoFile
 
-        val transcoded = File(context.cacheDir, "${projectId}_video_h264.mp4")
+        val transcoded = File(context.cacheDir, "video_only_${projectId}.mp4")
         if (transcoded.exists()) transcoded.delete()
 
         return withContext(Dispatchers.Main) {
@@ -143,71 +145,95 @@ class AudioDubbingMixer(private val context: Context) {
         bgmDuckingLevel: Float,
         outPcmFile: File
     ) {
-        val totalSamples = ((durationMs.coerceAtLeast(1000L) * TARGET_SAMPLE_RATE) / 1000L).toInt()
-        val origPcm = decodeAudioToMono44k(extractedAudioFile, totalSamples)
+        val origPcm = if (preserveBgm && extractedAudioFile.exists()) {
+            decodeAudioToMono44k(extractedAudioFile)
+        } else {
+            ShortArray(0)
+        }
+
+        val estimatedSamples = ((durationMs.coerceAtLeast(1000L) / 1000.0) * TARGET_SAMPLE_RATE).toInt()
+        val totalSamples = maxOf(estimatedSamples, origPcm.size)
+        val mixSamples = ShortArray(totalSamples)
 
         val speechRegions = segments.map { it.startMs to it.endMs }
-        val mixSamples = ShortArray(maxOf(totalSamples, origPcm.size))
+        val fadeSamples = (TARGET_SAMPLE_RATE * 0.04).toInt().coerceAtLeast(1)
 
-        // Step 1: Apply side-chain BGM & SFX ducking envelope
-        val fadeSamples = (TARGET_SAMPLE_RATE * 0.06f).toInt()
-        for (i in mixSamples.indices) {
+        // ជំហានទី ១៖ លាយភ្លេងដើម និងបន្ថយសំឡេងភ្លេងពេលតួអង្គនិយាយ (Ducking)
+        for (i in 0 until totalSamples) {
             val timeMs = (i.toLong() * 1000L) / TARGET_SAMPLE_RATE
             val bgmGain = if (!preserveBgm) {
                 0f
             } else {
-                val active = speechRegions.any { (start, end) -> timeMs in start..end }
-                if (active && enableDubbing) bgmDuckingLevel.coerceIn(0.05f, 0.85f) else 0.90f
+                val active = speechRegions.any { (s, e) -> timeMs in s..e }
+                if (active && enableDubbing) bgmDuckingLevel.coerceIn(0.05f, 1.0f) else 1.0f
             }
-            val orig = if (i < origPcm.size) origPcm[i] else 0
+            val orig = if (i < origPcm.size) origPcm[i].toFloat() else 0f
             mixSamples[i] = (orig * bgmGain).roundToInt().coerceIn(-32768, 32767).toShort()
         }
 
-        // Smooth edge pops around speech region transitions
-        if (preserveBgm && enableDubbing && fadeSamples > 0) {
-            for ((startMs, _) in speechRegions) {
-                val center = ((startMs * TARGET_SAMPLE_RATE) / 1000L).toInt()
-                val lo = (center - fadeSamples).coerceAtLeast(0)
-                val hi = (center + fadeSamples).coerceAtMost(mixSamples.lastIndex)
-                for (j in lo..hi) {
-                    val t = (j - lo).toFloat() / maxOf(1, hi - lo)
-                    val smooth = 0.85f + 0.15f * kotlin.math.abs(t - 0.5f) * 2f
-                    mixSamples[j] = (mixSamples[j] * smooth).roundToInt().toShort()
+        // Smooth edge pops around speech regions
+        if (preserveBgm && enableDubbing) {
+            for ((startMs, endMs) in speechRegions) {
+                val startIdx = ((startMs * TARGET_SAMPLE_RATE) / 1000L).toInt().coerceIn(0, totalSamples - 1)
+                val endIdx = ((endMs * TARGET_SAMPLE_RATE) / 1000L).toInt().coerceIn(0, totalSamples - 1)
+                for (k in 0 until fadeSamples) {
+                    val idxBefore = startIdx - k
+                    if (idxBefore in 0 until totalSamples && idxBefore < origPcm.size) {
+                        val t = k.toFloat() / fadeSamples
+                        val gain = bgmDuckingLevel + (1f - bgmDuckingLevel) * t
+                        mixSamples[idxBefore] = (origPcm[idxBefore] * gain).roundToInt().coerceIn(-32768, 32767).toShort()
+                    }
+                    val idxAfter = endIdx + k
+                    if (idxAfter in 0 until totalSamples && idxAfter < origPcm.size) {
+                        val t = k.toFloat() / fadeSamples
+                        val gain = bgmDuckingLevel + (1f - bgmDuckingLevel) * t
+                        mixSamples[idxAfter] = (origPcm[idxAfter] * gain).roundToInt().coerceIn(-32768, 32767).toShort()
+                    }
                 }
             }
         }
 
-        // Step 2: Overlay Khmer TTS dubbing WAV clips at their exact startMs
+        // ជំហានទី ២៖ បញ្ចូលសំឡេងនិយាយខ្មែរ (TTS) តាមម៉ោងកំណត់
         if (enableDubbing) {
             for (seg in segments) {
                 val wavFile = ttsClips[seg.index] ?: continue
-                val dubSamples = readWavAsMono44k(wavFile)
-                if (dubSamples.isEmpty()) continue
-                val startSample = ((seg.startMs * TARGET_SAMPLE_RATE) / 1000L).toInt()
-                    .coerceIn(0, mixSamples.lastIndex)
-                val maxWindowSamples = (((seg.endMs - seg.startMs).coerceAtLeast(1500L) + 600L) * TARGET_SAMPLE_RATE / 1000L).toInt()
-                val copyCount = minOf(dubSamples.size, maxWindowSamples, mixSamples.size - startSample)
-                for (j in 0 until copyCount) {
-                    val idx = startSample + j
-                    val combined = mixSamples[idx].toInt() + (dubSamples[j].toInt() * 1.05f).roundToInt()
-                    mixSamples[idx] = combined.coerceIn(-32768, 32767).toShort()
+                if (!wavFile.exists()) continue
+                val ttsSamples = readWavAsMono44k(wavFile)
+                if (ttsSamples.isEmpty()) continue
+
+                val startSample = ((seg.startMs * TARGET_SAMPLE_RATE) / 1000L).toInt().coerceAtLeast(0)
+                for (j in ttsSamples.indices) {
+                    val targetIdx = startSample + j
+                    if (targetIdx >= totalSamples) break
+                    val mixed = mixSamples[targetIdx].toInt() + (ttsSamples[j].toInt() * 1.15f).roundToInt()
+                    mixSamples[targetIdx] = mixed.coerceIn(-32768, 32767).toShort()
                 }
             }
         }
 
-        // Write little-endian 16-bit PCM file
+        // ជំហានទី ៣៖ សរសេរចូលឯកសារជាដុំតូចៗ (Streaming) ដើម្បីការពារកុំឲ្យអស់ RAM (OutOfMemoryError)
         if (outPcmFile.exists()) outPcmFile.delete()
-        val byteBuf = ByteBuffer.allocate(mixSamples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (s in mixSamples) {
-            byteBuf.putShort(s)
+        BufferedOutputStream(FileOutputStream(outPcmFile), 65536).use { out ->
+            val chunkSize = 8192
+            val byteBuf = ByteBuffer.allocate(chunkSize * 2).order(ByteOrder.LITTLE_ENDIAN)
+            var offset = 0
+            while (offset < totalSamples) {
+                val count = minOf(chunkSize, totalSamples - offset)
+                byteBuf.clear()
+                for (i in 0 until count) {
+                    byteBuf.putShort(mixSamples[offset + i])
+                }
+                out.write(byteBuf.array(), 0, count * 2)
+                offset += count
+            }
+            out.flush()
         }
-        outPcmFile.writeBytes(byteBuf.array())
     }
 
-    private fun decodeAudioToMono44k(audioFile: File, expectedSamples: Int): ShortArray {
+    private fun decodeAudioToMono44k(audioFile: File): ShortArray {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
-        val collected = ArrayList<Short>(expectedSamples)
+        val collected = ArrayList<Short>()
         try {
             extractor.setDataSource(audioFile.absolutePath)
             var trackIndex = -1
@@ -221,10 +247,10 @@ class AudioDubbingMixer(private val context: Context) {
                     break
                 }
             }
-            if (trackIndex < 0 || trackFormat == null) return ShortArray(expectedSamples)
+            if (trackIndex < 0 || trackFormat == null) return ShortArray(0)
 
             extractor.selectTrack(trackIndex)
-            val mime = trackFormat.getString(MediaFormat.KEY_MIME)!!
+            val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: return ShortArray(0)
             val srcRate = trackFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val srcChannels = trackFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceAtLeast(1)
 
@@ -240,7 +266,7 @@ class AudioDubbingMixer(private val context: Context) {
                 if (!inputDone) {
                     val inIdx = codec.dequeueInputBuffer(10_000L)
                     if (inIdx >= 0) {
-                        val inBuf = codec.getInputBuffer(inIdx)!!
+                        val inBuf = codec.getInputBuffer(inIdx) ?: continue
                         val sampleSize = extractor.readSampleData(inBuf, 0)
                         if (sampleSize < 0) {
                             codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
@@ -258,10 +284,10 @@ class AudioDubbingMixer(private val context: Context) {
                     if (outBuf != null && bufferInfo.size > 0) {
                         outBuf.position(bufferInfo.offset)
                         outBuf.limit(bufferInfo.offset + bufferInfo.size)
+                        outBuf.order(ByteOrder.LITTLE_ENDIAN)
                         val shortCount = bufferInfo.size / 2
                         val frameCount = shortCount / srcChannels
                         val tempFrame = ShortArray(frameCount)
-                        outBuf.order(ByteOrder.LITTLE_ENDIAN)
                         for (f in 0 until frameCount) {
                             var sum = 0
                             for (c in 0 until srcChannels) {
@@ -278,7 +304,7 @@ class AudioDubbingMixer(private val context: Context) {
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Decode fallback due to: ${e.localizedMessage}")
+            Log.w(TAG, "Decode fallback: ${e.message}")
         } finally {
             runCatching { codec?.stop(); codec?.release() }
             runCatching { extractor.release() }
@@ -293,7 +319,6 @@ class AudioDubbingMixer(private val context: Context) {
         val channels = buf.getShort(22).toInt().coerceAtLeast(1)
         val sampleRate = buf.getInt(24).coerceAtLeast(8000)
 
-        // Locate "data" chunk dynamically
         var offset = 12
         var dataOffset = 44
         var dataSize = bytes.size - 44
@@ -320,7 +345,7 @@ class AudioDubbingMixer(private val context: Context) {
             mono[i] = (sum / channels).toShort()
         }
         if (sampleRate == TARGET_SAMPLE_RATE) return mono
-        val resampled = ArrayList<Short>((frameCount.toLong() * TARGET_SAMPLE_RATE / sampleRate).toInt() + 16)
+        val resampled = ArrayList<Short>()
         appendResampled(mono, sampleRate, TARGET_SAMPLE_RATE, resampled)
         return resampled.toShortArray()
     }
@@ -337,11 +362,11 @@ class AudioDubbingMixer(private val context: Context) {
             return
         }
         val ratio = srcRate.toDouble() / dstRate.toDouble()
-        val outCount = (input.size / ratio).toInt().coerceAtLeast(1)
+        val outCount = (input.size / ratio).toInt()
         for (i in 0 until outCount) {
             val pos = i * ratio
-            val idx0 = pos.toInt().coerceIn(0, input.lastIndex)
-            val idx1 = (idx0 + 1).coerceIn(0, input.lastIndex)
+            val idx0 = pos.toInt().coerceIn(0, input.size - 1)
+            val idx1 = (idx0 + 1).coerceIn(0, input.size - 1)
             val frac = pos - idx0
             val sample = input[idx0] * (1.0 - frac) + input[idx1] * frac
             out.add(sample.roundToInt().coerceIn(-32768, 32767).toShort())
@@ -371,7 +396,7 @@ class AudioDubbingMixer(private val context: Context) {
                 encoder.start()
 
                 val bufferInfo = MediaCodec.BufferInfo()
-                val chunk = ByteArray(4096)
+                val chunk = ByteArray(8192)
                 var totalBytesRead = 0L
                 var inputDone = false
                 var outputDone = false
@@ -380,16 +405,17 @@ class AudioDubbingMixer(private val context: Context) {
                     if (!inputDone) {
                         val inIdx = encoder.dequeueInputBuffer(10_000L)
                         if (inIdx >= 0) {
-                            val inBuf = encoder.getInputBuffer(inIdx)!!
+                            val inBuf = encoder.getInputBuffer(inIdx) ?: continue
                             inBuf.clear()
-                            val read = raf.read(chunk, 0, minOf(chunk.size, inBuf.remaining()))
-                            if (read <= 0) {
-                                val ptsUs = (totalBytesRead / 2) * 1_000_000L / TARGET_SAMPLE_RATE
+                            val maxRead = minOf(chunk.size, inBuf.remaining())
+                            val read = raf.read(chunk, 0, maxRead)
+                            if (read < 0) {
+                                val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
                                 encoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                                 inputDone = true
                             } else {
                                 inBuf.put(chunk, 0, read)
-                                val ptsUs = (totalBytesRead / 2) * 1_000_000L / TARGET_SAMPLE_RATE
+                                val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
                                 totalBytesRead += read
                                 encoder.queueInputBuffer(inIdx, 0, read, ptsUs, 0)
                             }
@@ -462,7 +488,7 @@ class AudioDubbingMixer(private val context: Context) {
             }
 
             if (srcVideoTrack < 0 || videoFormat == null || srcAudioTrack < 0 || audioFormat == null) {
-                throw IllegalStateException("Missing video or mixed audio track for MP4 export.")
+                throw IllegalStateException("រកមិនឃើញ Track វីដេអូ ឬសំឡេងសម្រាប់បញ្ចូលគ្នា")
             }
 
             videoExtractor.selectTrack(srcVideoTrack)
@@ -473,10 +499,17 @@ class AudioDubbingMixer(private val context: Context) {
             muxer.start()
             muxerStarted = true
 
-            val buffer = ByteBuffer.allocate(1024 * 1024)
+            // បង្កើនទំហំ Buffer ដល់ 2MB ដើម្បីការពារ BufferOverflowException ពេលផលិត MP4
+            val maxInputSize = if (videoFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                maxOf(videoFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE), 2 * 1024 * 1024)
+            } else {
+                2 * 1024 * 1024
+            }
+            val buffer = ByteBuffer.allocateDirect(maxInputSize)
             val info = MediaCodec.BufferInfo()
 
             while (true) {
+                buffer.clear()
                 val sampleSize = videoExtractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
                 info.offset = 0
@@ -492,6 +525,7 @@ class AudioDubbingMixer(private val context: Context) {
             }
 
             while (true) {
+                buffer.clear()
                 val sampleSize = audioExtractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
                 info.offset = 0
