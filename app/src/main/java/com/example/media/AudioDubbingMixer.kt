@@ -58,7 +58,7 @@ class AudioDubbingMixer(private val context: Context) {
         val pcmBufferFile = File(context.cacheDir, "mix_${projectId}.pcm")
         val mixedAacFile = File(context.cacheDir, "mix_${projectId}.m4a")
         try {
-            withContext(Dispatchers.IO) {
+            withContext<Unit>(Dispatchers.IO) {
                 buildMixedPcmFast(
                     extractedAudioFile = extractedAudioFile,
                     durationMs = durationMs,
@@ -87,7 +87,7 @@ class AudioDubbingMixer(private val context: Context) {
     @OptIn(UnstableApi::class)
     private suspend fun ensureMp4VideoTrack(projectId: String, sourceVideoFile: File): File {
         val extractor = MediaExtractor()
-        val needsTranscode = withContext(Dispatchers.IO) {
+        val needsTranscode: Boolean = withContext(Dispatchers.IO) {
             try {
                 extractor.setDataSource(sourceVideoFile.absolutePath)
                 var videoMime: String? = null
@@ -459,36 +459,4 @@ class AudioDubbingMixer(private val context: Context) {
                         val inIdx = encoder.dequeueInputBuffer(5_000L)
                         if (inIdx >= 0) {
                             didWork = true
-                            val inBuf = encoder.getInputBuffer(inIdx)
-                            if (inBuf != null) {
-                                inBuf.clear()
-                                val maxRead = minOf(chunk.size, inBuf.remaining())
-                                val read = raf.read(chunk, 0, maxRead)
-                                if (read < 0) {
-                                    val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
-                                    encoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                    inputDone = true
-                                } else {
-                                    inBuf.put(chunk, 0, read)
-                                    val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
-                                    totalBytesRead += read
-                                    encoder.queueInputBuffer(inIdx, 0, read, ptsUs, 0)
-                                }
-                            }
-                        }
-                    }
-
-                    val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 5_000L)
-                    when {
-                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            didWork = true
-                            if (!muxerStarted) {
-                                trackIndex = muxer.addTrack(encoder.outputFormat)
-                                muxer.start()
-                                muxerStarted = true
-                            }
-                        }
-                        outIdx >= 0 -> {
-                            didWork = true
-                            val outBuf = encoder.getOutputBuffer(outIdx)
-                            if
+                            val in
