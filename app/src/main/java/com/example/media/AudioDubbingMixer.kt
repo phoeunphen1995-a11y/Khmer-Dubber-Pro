@@ -59,7 +59,7 @@ class AudioDubbingMixer(private val context: Context) {
         val mixedAacFile = File(context.cacheDir, "mix_${projectId}.m4a")
         try {
             withContext(Dispatchers.IO) {
-                buildMixedPcmStreaming(
+                buildMixedPcmFast(
                     extractedAudioFile = extractedAudioFile,
                     durationMs = durationMs,
                     segments = segments,
@@ -139,10 +139,9 @@ class AudioDubbingMixer(private val context: Context) {
     }
 
     /**
-     * លាយសំឡេងតាមរបៀប Streaming លើ Disk ផ្ទាល់ (មិនផ្ទុកក្នុង RAM)
-     * ការពារ OutOfMemoryError 100% ទោះបីវីដេអូ ៣០ នាទីក៏ដោយ
+     * លាយសំឡេងល្បឿនលឿនបំផុត (O(N) Linear Speed) និងមិនស៊ី RAM
      */
-    private fun buildMixedPcmStreaming(
+    private fun buildMixedPcmFast(
         extractedAudioFile: File,
         durationMs: Long,
         segments: List<SubtitleSegment>,
@@ -164,17 +163,28 @@ class AudioDubbingMixer(private val context: Context) {
 
         val estimatedSamples = ((durationMs.coerceAtLeast(1000L) / 1000.0) * TARGET_SAMPLE_RATE).toLong()
         val totalSamples = maxOf(estimatedSamples, decodedBgmSamples)
-        val speechRegions = segments.map { it.startMs to it.endMs }
-        val duckGain = bgmDuckingLevel.coerceIn(0.05f, 1.0f)
 
-        // ជំហានទី ១៖ សរសេរភ្លេងដើមចូល outPcmFile ជាកំណាត់តូចៗ (4096 samples ម្តង)
-        val blockSamples = 4096
+        // រៀបចំចន្លោះ Sample ដែលត្រូវបន្ថយសំឡេងភ្លេងដើម (Ducking) ជាមុន ដើម្បីកុំឲ្យ Loop យឺត
+        val sortedRanges = if (preserveBgm && enableDubbing) {
+            segments.map { seg ->
+                val s = ((seg.startMs * TARGET_SAMPLE_RATE) / 1000L).coerceAtLeast(0L)
+                val e = ((seg.endMs * TARGET_SAMPLE_RATE) / 1000L).coerceAtLeast(s)
+                s to e
+            }.sortedBy { it.first }
+        } else {
+            emptyList()
+        }
+
+        val duckGain = bgmDuckingLevel.coerceIn(0.05f, 1.0f)
+        val blockSamples = 16384
         val inBytes = ByteArray(blockSamples * 2)
         val outBytes = ByteArray(blockSamples * 2)
         val inBuf = ByteBuffer.wrap(inBytes).order(ByteOrder.LITTLE_ENDIAN)
         val outBuf = ByteBuffer.wrap(outBytes).order(ByteOrder.LITTLE_ENDIAN)
 
         val bgmRaf = if (decodedBgmSamples > 0L && tempBgmFile.exists()) RandomAccessFile(tempBgmFile, "r") else null
+        var rangeIdx = 0
+
         try {
             BufferedOutputStream(FileOutputStream(outPcmFile), 65536).use { out ->
                 var sampleIdx = 0L
@@ -194,15 +204,19 @@ class AudioDubbingMixer(private val context: Context) {
                     for (i in 0 until count) {
                         val currentSample = sampleIdx + i
                         val orig = if (i < availableInSamples) inBuf.getShort(i * 2).toFloat() else 0f
-                        val finalSample = if (!preserveBgm || orig == 0f) {
-                            0
+                        if (!preserveBgm || orig == 0f) {
+                            outBuf.putShort(0)
                         } else {
-                            val timeMs = (currentSample * 1000L) / TARGET_SAMPLE_RATE
-                            val active = speechRegions.any { (s, e) -> timeMs in s..e }
-                            val gain = if (active && enableDubbing) duckGain else 1.0f
-                            (orig * gain).roundToInt().coerceIn(-32768, 32767)
+                            while (rangeIdx < sortedRanges.size && sortedRanges[rangeIdx].second < currentSample) {
+                                rangeIdx++
+                            }
+                            val isSpeech = rangeIdx < sortedRanges.size &&
+                                    currentSample >= sortedRanges[rangeIdx].first &&
+                                    currentSample <= sortedRanges[rangeIdx].second
+                            val gain = if (isSpeech) duckGain else 1.0f
+                            val mixed = (orig * gain).roundToInt().coerceIn(-32768, 32767)
+                            outBuf.putShort(mixed.toShort())
                         }
-                        outBuf.putShort(finalSample.toShort())
                     }
                     out.write(outBytes, 0, count * 2)
                     sampleIdx += count
@@ -213,7 +227,7 @@ class AudioDubbingMixer(private val context: Context) {
             runCatching { bgmRaf?.close() }
         }
 
-        // ជំហានទី ២៖ លាយសំឡេងនិយាយខ្មែរ (TTS) ចូលត្រង់ទីតាំង Byte ផ្ទាល់លើ Disk
+        // បញ្ចូលសំឡេងនិយាយខ្មែរ (TTS) ផ្ទាល់ទៅកាន់ទីតាំង Byte លើ Disk
         if (enableDubbing) {
             RandomAccessFile(outPcmFile, "rw").use { mixRaf ->
                 val maxFileBytes = mixRaf.length()
@@ -282,26 +296,32 @@ class AudioDubbingMixer(private val context: Context) {
             val bufferInfo = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
+            var idleCount = 0
 
             BufferedOutputStream(FileOutputStream(outRawPcmFile), 65536).use { out ->
-                while (!outputDone) {
+                while (!outputDone && idleCount < 500) {
+                    var didWork = false
                     if (!inputDone) {
-                        val inIdx = codec.dequeueInputBuffer(10_000L)
+                        val inIdx = codec.dequeueInputBuffer(5_000L)
                         if (inIdx >= 0) {
-                            val inBuf = codec.getInputBuffer(inIdx) ?: continue
-                            val sampleSize = extractor.readSampleData(inBuf, 0)
-                            if (sampleSize < 0) {
-                                codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inputDone = true
-                            } else {
-                                codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
-                                extractor.advance()
+                            didWork = true
+                            val inBuf = codec.getInputBuffer(inIdx)
+                            if (inBuf != null) {
+                                val sampleSize = extractor.readSampleData(inBuf, 0)
+                                if (sampleSize < 0) {
+                                    codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                    inputDone = true
+                                } else {
+                                    codec.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
+                                    extractor.advance()
+                                }
                             }
                         }
                     }
 
-                    val outIdx = codec.dequeueOutputBuffer(bufferInfo, 10_000L)
+                    val outIdx = codec.dequeueOutputBuffer(bufferInfo, 5_000L)
                     if (outIdx >= 0) {
+                        didWork = true
                         val outBuf = codec.getOutputBuffer(outIdx)
                         if (outBuf != null && bufferInfo.size > 0) {
                             outBuf.position(bufferInfo.offset)
@@ -329,7 +349,11 @@ class AudioDubbingMixer(private val context: Context) {
                         if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                             outputDone = true
                         }
+                    } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        didWork = true
                     }
+
+                    idleCount = if (didWork) 0 else idleCount + 1
                 }
                 out.flush()
             }
@@ -420,41 +444,54 @@ class AudioDubbingMixer(private val context: Context) {
                 var totalBytesRead = 0L
                 var inputDone = false
                 var outputDone = false
+                var idleCount = 0
 
-                while (!outputDone) {
+                while (!outputDone && idleCount < 500) {
+                    var didWork = false
                     if (!inputDone) {
-                        val inIdx = encoder.dequeueInputBuffer(10_000L)
+                        val inIdx = encoder.dequeueInputBuffer(5_000L)
                         if (inIdx >= 0) {
-                            val inBuf = encoder.getInputBuffer(inIdx) ?: continue
-                            inBuf.clear()
-                            val maxRead = minOf(chunk.size, inBuf.remaining())
-                            val read = raf.read(chunk, 0, maxRead)
-                            if (read < 0) {
-                                val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
-                                encoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inputDone = true
-                            } else {
-                                inBuf.put(chunk, 0, read)
-                                val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
-                                totalBytesRead += read
-                                encoder.queueInputBuffer(inIdx, 0, read, ptsUs, 0)
+                            didWork = true
+                            val inBuf = encoder.getInputBuffer(inIdx)
+                            if (inBuf != null) {
+                                inBuf.clear()
+                                val maxRead = minOf(chunk.size, inBuf.remaining())
+                                val read = raf.read(chunk, 0, maxRead)
+                                if (read < 0) {
+                                    val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
+                                    encoder.queueInputBuffer(inIdx, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                    inputDone = true
+                                } else {
+                                    inBuf.put(chunk, 0, read)
+                                    val ptsUs = (totalBytesRead / 2L) * 1_000_000L / TARGET_SAMPLE_RATE
+                                    totalBytesRead += read
+                                    encoder.queueInputBuffer(inIdx, 0, read, ptsUs, 0)
+                                }
                             }
                         }
                     }
 
-                    val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 10_000L)
+                    val outIdx = encoder.dequeueOutputBuffer(bufferInfo, 5_000L)
                     when {
                         outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            trackIndex = muxer.addTrack(encoder.outputFormat)
-                            muxer.start()
-                            muxerStarted = true
+                            didWork = true
+                            if (!muxerStarted) {
+                                trackIndex = muxer.addTrack(encoder.outputFormat)
+                                muxer.start()
+                                muxerStarted = true
+                            }
                         }
                         outIdx >= 0 -> {
+                            didWork = true
                             val outBuf = encoder.getOutputBuffer(outIdx)
                             if (outBuf != null && bufferInfo.size > 0 &&
-                                (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 &&
-                                muxerStarted
+                                (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0
                             ) {
+                                if (!muxerStarted) {
+                                    trackIndex = muxer.addTrack(encoder.outputFormat)
+                                    muxer.start()
+                                    muxerStarted = true
+                                }
                                 outBuf.position(bufferInfo.offset)
                                 outBuf.limit(bufferInfo.offset + bufferInfo.size)
                                 muxer.writeSampleData(trackIndex, outBuf, bufferInfo)
@@ -465,6 +502,8 @@ class AudioDubbingMixer(private val context: Context) {
                             }
                         }
                     }
+
+                    idleCount = if (didWork) 0 else idleCount + 1
                 }
             } finally {
                 runCatching { encoder.stop(); encoder.release() }
